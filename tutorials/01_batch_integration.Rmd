@@ -1,0 +1,183 @@
+---
+title: "Integrating single cell data from different batches"
+date: "`r Sys.Date()`"
+author: "Your name"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+
+# Introduction
+
+This project aims at integrating single-cell data from different batches. Lots of different tools have been developed for this purpose and we will explore some of these in the following tutorial. 
+
+# Load libraries
+
+To get started please load the following libraries that you will need for this analysis. Please make sure that you have Seurat version 5 since the batch integration worked differently in older versions. A Seurat v5 cheat sheet with the essential commands, can be found [here](https://satijalab.org/seurat/articles/seurat5_essential_commands).
+
+```{r eval = FALSE, include = FALSE}
+# if not installed yet, install the packages like this
+install.packages("devtools")
+# Seurat version 5
+install.packages("Seurat")
+# SeuratData
+devtools::install_github('satijalab/seurat-data')
+# tidyverse
+install.packages("tidyverse")
+# uwot
+install.packages("uwot")
+# lisi
+devtools::install_github("immunogenomics/lisi")
+```
+
+```{r message = FALSE}
+library(Seurat)
+library(SeuratData)
+library(tidyverse)
+library(uwot)
+library(lisi)
+```
+
+```{r eval = FALSE, include = FALSE}
+# verify that you have Seurat version 5 installed
+packageVersion("Seurat")
+```
+
+
+# Part 1 - Data visualization and processing
+For this project, we are using data consisting of 8 pancreas data sets which are provided by the SeuratData package as a Seurat object. Since the data is coming from different studies with different sequencing technologies, batch integration is necessary here to be able to analyse all cells jointly.
+```{r message = FALSE, warning = FALSE}
+InstallData("panc8")
+seurat <- LoadData("panc8")
+seurat[["RNA"]] <- split(seurat[["RNA"]], f = seurat$dataset)
+```
+
+**Task 1: Let's first have a look at the Seurat object we just read in. How many cells and genes are included? Which information is contained in the metadata? And how many cells per celltype were measured?**
+
+
+As mentioned above, the Seurat object consists of 8 different pancreas data sets. But how different are they? What happens if we just treat them as a single data set without considering potential batch effects? 
+```{r}
+unique(seurat$dataset)
+```
+
+
+**Task 2: Let's start by inspecting some general differences across data sets based on the meta data. To do so, check the cell type composition per dataset using a stacked bar plot.**
+
+
+So far, we gained a first impression about our data, but haven't looked at the gene expression itself yet. To visualize the gene expression profiles of all cells, we can create a UMAP. For this, the data has to be normalized first following the standard Seurat processing pipeline.
+
+**Task 3: Use Seurat to process the count data and run a PCA. At how many principal components would you look at?**
+
+
+**Task 4: Create UMAP plots coloring by sequencing technology ('tech') or celltype. Do you observe batch effects?**
+
+
+Before trying out various batch integration methods, we do clustering on the PCA embedding of the unintegrated data. After batch integration, we will do another round of clustering and compare whether cluster purity changes.
+
+**Task 5: Use Seurat to cluster the cells based on the PCA embedding. Do the clusters mostly consist of a single celltype or dataset or are mixed? Hint: Visualize this with stacked barplots showing the proportions of celltypes or datasets per cluster.**
+
+# Part 2 - Batch integration
+Batch integration can be done either via a manual projection e.g. based on a PCA or based on automatic integration using methods provided in Seurat or separate tools.
+
+## Manual projection
+```{r}
+# for two data sets: indrop2 and indrop3
+# get normalized data
+Y1 <- as.matrix(GetAssayData(seurat, assay = "RNA", layer = "scale.data")[,seurat$dataset == "indrop2"])
+Y2 <- as.matrix(GetAssayData(seurat, assay = "RNA", layer = "scale.data")[,seurat$dataset == "indrop3"])
+
+# `prcomp` is R's name for PCA and IRLBA is an algorithm to calculate it
+ref_pca <- irlba::prcomp_irlba(t(Y1), n = 20)
+Z1 <- ref_pca$x
+
+# project cells from second condition onto the reference embedding
+Z2 <- t(ref_pca$rotation) %*% Y2
+
+# Combine both datasets into a single PCA matrix
+Z_all <- rbind(Z1, t(Z2))  
+
+# Compute UMAP embedding
+umap_result <- umap(Z_all)
+
+# Create a dataframe for visualization
+umap_df <- data.frame(
+  UMAP1 = umap_result[,1],
+  UMAP2 = umap_result[,2],
+  dataset = rep(c("indrop2", "indrop3"), times = c(ncol(Y1), ncol(Y2)))  # Labels for batches
+)
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = dataset)) +
+  geom_point(alpha = 0.3, size = 0.3) +
+  theme_bw()
+```
+
+**Task 6: Try this approach also on two other datasets and discuss how well this approach works. What are potential limitations?**
+
+
+
+## Automated integration
+The function IntegrateLayers in Seurat v5 contains 5 different methods for batch integration. We start by using the CCAIntegration method which first uses canonical correlation analysis to identify shared sources of variation and then finds anchors (matched cell pairs) which are used for batch correction.
+```{r}
+# perform batch integration
+# (this step takes around 1-2mins to run)
+# (in case the run time is much longer on your laptop, subset the data to contain only 2 datasets)
+seurat <- IntegrateLayers(object = seurat, method = CCAIntegration, 
+                          orig.reduction = "pca", new.reduction = "integrated.cca",
+                          verbose = FALSE)
+```
+
+**Task 7: Perform a UMAP on the batch-corrected data ("integrated.cca") and color the plot by dataset and celltype to check how well the batch correction worked.**
+
+
+Next, we would like to also try out some of the other batch integration methods that are included in Seurat. An overview about them can be found on [this website](https://satijalab.org/seurat/articles/seurat5_integration).
+
+**Task 8: Select another batch integration method of your choice from Seurat. How does this method differ from CCAIntegration? Apply the batch integration method to your data and visualize the results with UMAPs as above.**
+
+
+So far, we used UMAPs to visualize batch effects and check the integration performance. However, this is not a quantitative measure making accurate comparisons between various methods challenging. Therefore, various metrics have been developed to measure batch integration and a description of them can be found in this [benchmarking paper](https://link.springer.com/article/10.1186/s13059-019-1850-9). In the following, we focus on using LISI to measure celltype and batch mixing after integration and follow the procedure described in the paper: "In the case of LISI integration (iLISI) to measure batch mixing, the index is computed for batch labels, and a score close to the expected number of batches denotes good mixing. For cell type LISI (cLISI), the index is computed for all cell type labels, and a score close to 1 denotes that the clusters contain pure cell types. We computed the iLISI and cLISI scores for each cell in the dataset, and then determined the median values. To scale the median scores, we used the respective maximum and minimum scores. For combined assessment of cell type purity and batch mixing, the harmonic mean of cLISI and iLISI was computed to obtain the F1 score as described by Lin et al. A higher F1 score indicates superior batch correction." 
+
+```{r}
+# run LISI on the CCA integration
+lisi_scores <- compute_lisi(Embeddings(seurat, reduction = "integrated.cca"),
+                             seurat@meta.data,
+                            c("dataset", "celltype"), 
+                            perplexity = 200)
+
+# get scaled median of iLISI and cLISI
+ilisi_cca <- (median(lisi_scores$dataset) - min(lisi_scores$dataset)) /
+  (max(lisi_scores$dataset) - min(lisi_scores$dataset))
+clisi_cca <- (median(lisi_scores$celltype) - min(lisi_scores$celltype)) /
+  (max(lisi_scores$celltype) - min(lisi_scores$celltype))
+
+# calculate F1 score
+f1_cca <- (2 * (1-clisi_cca) * ilisi_cca) / (1 - clisi_cca + ilisi_cca)
+```
+
+**Task 9: Also run LISI on the other integration method you chose, as well as on the PCA embedding without any integration and the manual projection embedding and compare the F1 scores in a barplot. Which integration works best?**
+
+
+
+**Task 10: Redo the clustering on one of your batch-corrected embeddings and check how pure the clusters are now regarding to celltype and dataset. Compare the plots to the ones from Task 5.**
+
+
+**Task 11: In addition to the 'FindMarkers' function Seurat also contains the option to find marker genes correcting for batch effects such as the different datasets in the 'FindConservedMarkers' function. When specifying 'dataset' as grouping.var this function will find marker genes which are conserved for a celltype/cluster across the different datasets. Choose one annotated cell type (or one of your own clusters before and after batch integration) and apply the 'FindConservedMarkers' function. Plot the expression of some top genes across celltypes and datasets to verify your findings. Are these known marker genes for your selected celltype?**
+
+
+
+# Part 3 (optional) - Invertible integration with LEMUR
+With the Seurat integration tools we just explored there is no way to go back from the integrated embedding to the original gene space. A new tool called [LEMUR](https://bioconductor.org/packages/lemur/) provides this functionality by matching the subspace of each condition and details can be found in [this paper](https://www.nature.com/articles/s41588-024-01996-0). 
+1.) If you have time left, try to run LEMUR on the pancreas data and compare its embedding to the other batch integration methods. 
+2.) Additionally, LEMUR allows to do a continuous differential expression testing since we can ask for each cell the counterfactual what the expression of a cell from one expression would have been in another condition. This is most interesting for datasets which contain untreated and treated cells of different cell types such as the glioblastoma data used in [this vignette](https://www.bioconductor.org/packages/release/bioc/vignettes/lemur/inst/doc/Introduction.html). Use this data set to do a differential expression analysis with LEMUR following the tutorial. 
+
+
+# sessionInfo
+```{r}
+sessionInfo()
+```
