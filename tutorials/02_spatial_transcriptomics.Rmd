@@ -1,0 +1,292 @@
+---
+title: "Analysing spatial transcriptomics data"
+date: "`r Sys.Date()`"
+author: "Team name"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+# Introduction
+
+Previously, you have worked with single cell data, which was defined by $N$ cells and $D$ features, which can be any modality you can measure. In this tutorial, we will work with spatial data. When working with spatial data, you get for each observation (e.g., a cell, spot, or molecule) additional information about its spatial location as an $(x, y)$ coordinate. Therefore, depending on your experimental method, e.g., if it is sequencing-based or imaging-based, you get spatial information for each spot or molecule. In this tutorial you will learn:
+
+* How you can apply previously learned data analysis steps, such as data filtering, dimensional-reduction on spatial data.
+* How to apply more spatially aware methods to identify features that are spatially variable.
+* How to deal with different resolutions of the different experimental methods.
+* Optional 1: Learn spatial patterns with MEFISTO [Velten et al., 2022](https://www.nature.com/articles/s41592-021-01343-9).
+* Optional 2: Visual integration of different brain slices from different regions
+
+**Warm up task: Before you dive into the coding exercises, go through the [CARD](https://www.nature.com/articles/s41587-022-01273-7)) paper, a method we will use in this course.** 
+
+Discuss in your group following details:
+
+1. What is cell type deconvolution and why is it important?
+2. What is the main innovation behind the CARD method compared to previous deconvolution techniques?
+3. What are the assumptions behind CARD, and how might they impact performance in different tissue types?
+4. How does CARD include spatial information in their model?
+5. How does CARD perform deconvolution without a reference scRNA-seq dataset?
+6. How does their smoothing work?
+
+## install packages
+
+Following packages are needed for this tutorial.
+```{r message = FALSE, warning = FALSE, eval=FALSE}
+install.packages('Seurat')
+install.packages('devtools')
+devtools::install_github('satijalab/seurat-data')
+install.packages('ggplot2')
+install.packages('patchwork')
+install.packages('dplyr')
+BiocManager::install("spatialDE")
+install.packages("reticulate")
+devtools::install_github('YMa-lab/CARD')
+```
+
+Load the packages into your environment.
+
+```{r message = FALSE, warning = FALSE}
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(spatialDE) 
+library(reticulate) # this is needed for SpatialDE
+py_config() # this is needed for SpatialDE
+library(CARD)
+```
+
+# Part 1: Working with spatial transcriptomics data.
+
+For this project, we are using data mouse brain data from the anterior region which is provided by the SeuratData package as a Seurat object. The data was generated using the 10X Genomics Visium assay. So we get spatial spots. We have 31053 features and 2696 Visium spots. We have the raw counts saved in the Assay "Spatial" in the layer "counts". We also have image data stored in this Seurat object.
+
+```{r message = FALSE, warning = FALSE}
+InstallData("stxBrain")
+brain <- LoadData("stxBrain", type = "anterior1")
+brain
+```
+
+**Task 1: Explore the dataset, can you find the spatial coordinates in the Seurat object and plot them to get a coarse overview of the shape of the tissue slices?**
+
+
+Now, you can start with data preprocessing. For that think about the steps, you did for single cell data before. 
+
+**Task 2: Visualize the total number of counts for every spot. Hint: Check out the Seurat function ```SpatialFeaturePlot```**
+
+
+The distribution of molecular counts across tissue sections isn't solely driven by technical factors. It's intrinsically linked to biological variation as well. Consider the cortical white matter, which naturally contains fewer neurons and consistently shows reduced molecular counts. This biological variation presents a challenge for conventional normalization approaches.
+
+Standard methods like ```NormalizeData()``` that you explored previously from scRNA-seq data assume that differences in count depth are purely technical and force uniform scaling across all spots. However, this assumption can be problematic when analyzing spatially resolved data where count variations reflect genuine biological differences between tissue regions.
+
+Therefore Seurat is recommending to use ```SCTransform```. This approach constructs regularized negative binomial regression models that can distinguish between technical noise and biological signal. By modeling the relationship between sequencing depth and gene expression while applying regularization, ```SCTransform``` preserves meaningful biological variance while correcting for technical artifacts.
+
+When applied to your data, ```SCTransform``` will normalize expression values, identify highly variable features, and store the processed data in the SCT assay for downstream analysis.
+
+```{r message=FALSE, warning=FALSE}
+brain <- SCTransform(brain, assay = "Spatial", verbose = FALSE)
+```
+
+The normalized data is saved in the "SCT" layer, don't forget to select this layer in later downstream steps.
+
+```{r message=FALSE, warning=FALSE}
+brain
+```
+**Bonus Task: Think about the two different normalization techniques and apply both to your data and visualize the expression values of some genes of your choice.**
+
+
+**Task 3: Select one gene of your choice and plot its normalized expression using ```SpatialFeaturePlot```, which parameters can you vary in this plotting function?**
+
+
+**Task 4: Identify and visualize Highly Variable Genes (HVGs) for our brain data**
+
+Identifying highly variable genes helps focus on the most informative features that drive biological variation and this is useful in spatial transcriptomics analysis as well.
+
+
+
+
+
+## Dimensional reduction and clustering
+
+First, we can run the clustering pipeline, which you already familiar with from previous session on your preprocessed spatial data:
+
+```{r message=FALSE, warning=FALSE}
+brain <- RunPCA(brain, assay = "SCT", verbose = FALSE)
+brain <- FindNeighbors(brain, reduction = "pca", dims = 1:30)
+brain <- FindClusters(brain, verbose = FALSE)
+brain <- RunUMAP(brain, reduction = "pca", dims = 1:30)
+```
+
+Now, we can visualize the UMAP and the clustering and annotate these clusters directly in the tissue slice using the function ```SpatialDimPlot```.
+```{r message=FALSE, warning=FALSE}
+p1 <- DimPlot(brain, reduction = "umap", label = TRUE)
+p2 <- SpatialDimPlot(brain, label = TRUE, label.size = 3)
+p1 + p2
+```
+
+**Task 5: Perform differential expression analysis to identify marker genes for each cluster. What are the top marker genes you find? Create spatial feature plots for the top marker gene from each cluster. Based on the marker genes identified, can you assign putative cell types or tissue regions to each cluster (maybe google some genes)?** 
+
+
+Now, we have wrapped up all initial steps on spatial data and we could even identify some marker genes for spatial domains (regions where spots share similar variance). However, we still did not fully make use of the spatial information yet. In the next step, we can try to use spatial information.
+
+# Part 2: Using the spatial information in the analysis
+
+Previously, we identified highly variable genes (HVGs) based on their variance-to-mean ratio across all spots. However, this approach does not explicitly take spatial relationships into account. As a result, traditional HVG selection may miss genes that exhibit subtle yet spatially coherent variation.
+
+In this section, we will explore two methods that incorporate spatial information when identifying spatially variable genes:
+
+* [Moran’s I](https://en.wikipedia.org/wiki/Moran%27s_I), a spatial autocorrelation statistic, and
+* [SpatialDE](https://www.nature.com/articles/nmeth.4636), which uses a Gaussian process to model smooth spatial patterns.
+
+Moran’s I is widely used in the spatial omics community and demonstrates solid performance in benchmarks from the [OpenProblems](https://openproblems.bio/results/spatially_variable_genes?version=v1.0.0) community challenge on spatially variable gene detection. SpatialDE, on the other hand, models gene expression as a function of spatial coordinates, enabling it to detect more complex and smooth spatial trends.
+
+## Moran's I
+
+**Task 6: Compute Moran I's and plot the top 6 genes. Compare with your HVGs computed before and cluster marker genes. (Tipp: during my runs SpatiallyVariableFeatures did not work but you can find the calculated moransi ranks in the meta.features slot of your data)**
+
+
+## SpatialDE
+The SpatialDE package is written in Python, but it is also maintained through Bioconductor in R.
+
+Note: The spatialDE function is not integrated into Seurat's workflow, so we need to convert our data into the appropriate format before running the method.
+You can refer to the official SpatialDE [vignette](https://www.bioconductor.org/packages/release/bioc/vignettes/spatialDE/inst/doc/spatialDE.html) to understand the expected input data format.
+
+**Task 7: Browse the vignette and check out the data formats SpatialDE is expecting.**
+
+
+After getting the count data and position, normally SpatialDE does some normalization steps, including the normalization of our count data (```stabilize```) and ```regress_out``` the total counts per spot which is also called spot depth. We will skip this part, since we did normalization on our data already in previous steps
+
+```{r}
+#norm_expr <- stabilize(data)
+#resid_expr <- regress_out(norm_expr, sample_info = positions)
+```
+
+
+**Task 8: Compute spatially variable genes using SpatialDE and compare with the top moransi, hvgs and marker genes.**
+
+
+Now we can also plot the top 6 spatially variable genes from SpatialDE using the Seurat function ```SpatialFeaturePlot```.
+
+```{r}
+# get top 6 spatially variable genes from SpatialDE
+
+hspatialde <- results[order(-results$FSV), ][1:6, "g"]
+
+print(hspatialde )
+SpatialFeaturePlot(brain, features = hspatialde , ncol = 3, alpha = c(0.5, 1))
+
+```
+
+**Concluding (open) task 9: compare HVG, Moran's I and SpatialDE, what can you observe? Which one would you prefer for your downstream analysis and why?**
+
+
+# Part 3: How to get most information out of spots?
+
+Spatial transcriptomics often captures multiple cells per spot, especially with platforms like 10x Visium. This limits interpretability at the single-cell level. To address this, several methods deconvolute each spot’s expression into cell-type proportions. This typically requires:
+
+* A reference single-cell-RNA-seq dataset
+* Or, a list of marker genes per cell type
+
+We will use CARD, which supports reference-free decomposition using a *markerList* derived from prior biological knowledge, etc.
+
+We could use the [Allen Institute’s 14,000-cell SMART-Seq2 dataset](https://www.nature.com/articles/nn.4216) as a reference. However, to avoid potential computational burdens, we’ve precomputed a filtered marker list using: ```FindAllMarkers(allen_reference, group.by='subclass', max.cells.per.ident = 500, features = VariableFeatures(allen_reference))``` and filtered the top filtered.all.markers <- all.markers[all.markers$p_val_adj < 0.005, ]  for each cell type already. In the data folder of this Rmarkdown file you will find ```markerList.RData```, which is the data format CARD wants and the output of ```FindAllMarkers``` (e.g. ```allen_mouse_brain_markers.rds```). 
+
+
+
+**Task 9: Bring our list of marker genes in the right format for CARDS. Hint: load the *markerList* from the data folder and take a look.**
+
+
+**Task 10: Create a CARDfreeObject. Subset your data to contain only HVGs genes for computational reasons.**
+
+```{r message = FALSE, warning = FALSE}
+#create CARd object
+# spatial location we can just use from spatialDE X
+# spatial count data
+rownames(X) <- colnames(GetAssayData(brain, 'Spatial', 'count')[hvg, ])
+
+CARDfree_obj = createCARDfreeObject(
+	markerList = allenmarkerList,
+	spatial_count = GetAssayData(brain, 'Spatial', 'count')[hvg, ],
+	spatial_location = X,
+	minCountGene = 100,
+	minCountSpot =5)
+```
+
+
+Now you can run ```CARD_refFree``` on the object you've created in the previous tasks. This can take a few minutes. The cell types inferred from CARDfree are not labelled with the celltypes given in your markerList, therefore it might be difficult to interpret the results. The authors of CARD see this also as a clear limitation of their reference-free approach.
+
+```{r message = FALSE, warning = FALSE}
+# this can take a couple of minutes (~ 5 min)
+CARDfree_obj = CARD_refFree(CARDfree_obj)
+```
+
+
+**Task 11: Visualize cell type proportions using ```CARD.visualize.prop```. Compare with the distribution of HVGs, Moran's I, SpatialDE and clusters from previous tasks. What do you observe? Since the CARDfree approach does not come along with cell type labels, visualize all cell types (e.g. ```paste0('CT', 1:length(markerList))```) and check if you can find some cell type distributions that are similar to some spatial domains that you have discovered in the beginning.**
+
+```{r message = FALSE, warning = FALSE}
+ct.visualize = paste0('CT', 1:length(allenmarkerList))
+X_rotated = X[, c("x", "y")]
+colnames(X_rotated) = c("x", "y")
+X_rotated[, "y"] = -X_rotated[, "y"]
+
+
+## visualize the spatial distribution of the cell type proportion
+p2 <- CARD.visualize.prop(
+	proportion = CARDfree_obj@Proportion_CARD,        
+	spatial_location = X_rotated, 
+	ct.visualize = ct.visualize,                 ### selected cell types to visualize
+	colors = c("lightblue","lightyellow","red"), ### if not provide, we will use the default colors
+	NumCols = 5,                                 ### number of columns in the figure panel
+  pointSize = 0.2)                             ### point size in ggplot2 scatterplot  
+print(p2)
+```
+**Task 12: The CARDfree approach does not come along with cell type labels, but you have the marker genes for each cell type, therefore take the first gene for each cell type and visualize the expression pattern using ```SpatialFeaturePlot```, can you identify which cell type correspond to which CT? Hint: filter the marker genes to only contain markers that are in your HVGs. You can either use ```CARD.visualize.gene```, ```SpatialFeaturePlot``` or plot by yourself. If you are implementing it by yourself, you might be more flexible, otherwise you can only adjust the parameters given by the function you are using.**
+
+
+
+One of the main features of CARD is to increase their resolution by recomputing cell type proportions, which you can accomplish with the ```CARD.imputation``` function. 
+
+```{r message = FALSE, warning = FALSE}
+CARDfree_obj = CARD.imputation(CARDfree_obj,NumGrids = 2000,ineibor = 10,exclude = NULL)
+```
+
+**Task 13: Find the refined_prop in the data and visulize all the cell type distributions as in the previous task, what do you observe, in which use-cases this might be helpful?**
+
+
+**Task 14: With this refined representation, we can also visualize genes. However, in the  ```refined_expression``` object, genes are not annotted as for the cell types. But in this case we can, reannotate the genes. Go through the ```CARDfree_obj``` and find the gene annotations, check the total number of genes in the ```refined_expression``` object.**
+
+
+
+**Task 15 (Open question/concluding remarks): What insights do different methods (HVG, Moran’s I, SpatialDE, CARD) give you? Are there overlaps between genes or cell types identified? In your opinion, which methods produce smoother or more interpretable patterns? What would be your ideal workflow for analyzing a spatial transcriptomics dataset?**
+
+
+# Optional 1: Learning smooth spatial patterns using MEFISTO
+
+We’ve seen that CARD can estimate cell type proportions and refine gene expression. However, it relies on prior biological knowledge or references. MEFISTO offers an alternative: it directly learns smooth latent factors (e.g. cell type distributions) from spatial expression data using Gaussian processes, without needing cell type references or marker genes.
+
+These latent factors can:
+
+* Capture developmental gradients
+* Uncover spatially coordinated biological processes
+* Be linked to gene sets post hoc via the learned loadings
+
+Check out the [MEFISTO](https://raw.githack.com/bioFAM/MEFISTO_tutorials/master/MEFISTO_ST.html) vignette and run MEFISTO on our brain dataset and give MEFISTO the spatial coordinates as covariate.
+
+
+# Optional 2: Visually integrate brain regions
+
+The ```stxBrain``` dataset has data for two mouse brains, for the posterior and anterior region of the brain. So far we have used ```anterior1``` for our analysis. Check out the other available regions using ```?stxBrain``` and select the for the same slice the posterior region. Do some cell type analysis and compare, cell type distributios. Are some cell types shared or some more distinct to one of the regions.
+
+# sessionInfo
+
+
+```{r}
+sessionInfo()
+```
+
