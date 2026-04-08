@@ -1,0 +1,206 @@
+---
+title: "Inferring single cell trajectories"
+date: "`r Sys.Date()`"
+author: "Team name"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+# Introduction
+
+Single-cell RNA-seq provides a snapshot of cellular states at a given moment. However, many biological processes like differentiation, cell cycle progression, or immune activation occur as continua rather than discrete steps. Pseudotime analysis bridges this gap by:
+- Reconstructing the temporal ordering of cellular states
+- Identifying transition states that might be difficult to capture experimentally
+- Revealing branch points where cells commit to different fates
+- Enabling the study of gene regulation dynamics along developmental trajectories
+- Providing insights into the molecular mechanisms driving cell fate decisions
+
+Since you already heard about pseudotime analysis and learnt how to use monocle in the previous course week, we will do a mini-project in groups of 3 people about pseudo-time analysis today. To start with, each group should create a github repository for their code where every group member participates. Next, everyone goes through the first part of this Rmd file to get familiar with the data set and do some basic preprocessing steps. After that, you will work in small groups to explore different aspects of cellular dynamics in this dataset. Each group will focus on a specific question and apply computational methods to investigate it. The goal here is not to follow a strict protocol, but to:
+explore the data independently, apply methods you learned during the course and interpret your results biologically. At the end of the day, each group will give a short presentation (5 minutes). 
+
+
+# Environment Setup
+
+```{r eval = FALSE, include = FALSE}
+# Install BiocManager if not already installed
+if (!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Install necessary packages
+BiocManager::install(c('BiocGenerics', 'DelayedArray', 'DelayedMatrixStats',
+                       'limma', 'lme4', 'S4Vectors', 'SingleCellExperiment',
+                       'SummarizedExperiment', 'batchelor', 'HDF5Array',
+                       'ggrastr', 'Seurat', 'dplyr', 'ggplot2','scRNAseq',
+                       'satijalab/seurat-wrappers'), dependencies = TRUE)
+
+install.packages("devtools")
+remotes::install_github("bnprks/BPCells/r")
+devtools::install_github('cole-trapnell-lab/monocle3')
+
+```
+
+```{r message = FALSE}
+# Load required libraries
+library(monocle3)
+library(Seurat)
+library(SeuratWrappers)
+library(ggplot2)
+library(scRNAseq)
+library(dplyr) 
+```
+
+
+# Part 1 - Processing and exploring the data
+
+The `scRNAseq` package is a Bioconductor resource that provides access to a collection of publicly available single-cell RNA-seq datasets. These datasets are formatted as `SingleCellExperiment` objects. In this tutorial we will work with Seurat objects, but if you want to further learn how to create and manipulate `SingleCellExperiment` objects, check the [SingleCellExperiment vignette](https://bioconductor.org/packages/release/bioc/vignettes/SingleCellExperiment/inst/doc/intro.html). 
+
+For this tutorial, we will use the hematopoietic stem cell (HSC) dataset from [(Nestorowa et al., 2016)](https://ashpublications.org/blood/article/128/8/e20/35749/A-single-cell-resolution-map-of-mouse), which captures transcriptional profiles of mouse haematopoietic stem and progenitor cells (HSPCs). This dataset is ideal for trajectory inference because it represents a dynamic biological process: the differentiation of stem cells into various blood cell lineages.
+
+
+## Load dataset
+
+```{r message = FALSE}
+#This step can take a bit longer
+sce <- NestorowaHSCData()
+
+#Create seurat object
+seurat <- CreateSeuratObject(counts = counts(sce), meta.data = as.data.frame(colData(sce)))
+
+#Remove no longer necessary object
+rm(sce)
+```
+
+## Explore data
+
+**Task 1: Let's first explore the Seurat object we just created.** 
+
+Questions:
+1) How many cells and genes are included?
+2) Which information is contained in the metadata? Try to find out the meaning of each column.
+Suggestion: Inspect unique values in each categorical column and check the paper [paper](https://ashpublications.org/blood/article/128/8/e20/35749/A-single-cell-resolution-map-of-mouse) for specific terms.
+3) How many cells per cell type were measured considering broad gating? And considering narrow gating? 
+
+
+
+## QC metrics
+
+Some pre-processing steps were already performed by the authors, specifically to exclude low-quality cells. Before starting the analysis, let's perform some additional quality control checks to ensure the data meet the expected QC thresholds.
+
+**Task 2: Confirm that the distribution of QC metrics (nFeature_RNA and nCount_RNA) meet the required QC thresholds. Visualize their distribution using violin plots. **
+
+Typical thresholds used in single-cell RNA-seq QC:
+nFeature_RNA:
+Minimum: ≥500 (to exclude low-quality cells with few detected genes)
+
+nCount_RNA:
+Minimum: ≥1,000–10,000 (to exclude low-quality cells)
+
+
+
+
+## Process and visualize data
+
+So far, we have already a first view on our data, but before proceeding to trajectory analysis, let's first process the data using Seurat and visualize the gene expression profiles of all cells. For this, the data has to be normalized first following the standard Seurat processing pipeline.
+
+**Task 3: Use Seurat to process the count data (normalization and scaling), find the most highly variable genes, and perform dimensionality reduction (PCA and UMAP)**
+
+
+
+**Task 4: Plot the PCA and UMAP. Try coloring different groups. What is captured by the first principal components? How many components would you look at? Do you see a separation of the different cell populations and cell types in the plots? What can you conclude from these plots? Can you already identify some differentiation patterns? **
+
+
+
+# Part 2 - Mini-projects
+
+Monocle3 implements a powerful framework for trajectory inference that can capture complex branching processes, such as hematopoietic differentiation. Its workflow consists of several core steps:
+1.) Dimensionality reduction (e.g. UMAP)
+2.) Clustering of cells
+3.) Learning the principal graph
+4.) Computing pseudotime
+
+In this part, each group will apply the general Monocle3 workflow and then focus on one specific aspect of the analysis. The goal is to explore the data more independently, generate a small set of results, and interpret them biologically. Each group should prepare 2 key plots to show to everyone at the end of the day.
+
+**Topic 1 (Groups 1 & 2): Marker genes and cluster characterization**
+Identify the top marker genes for each cluster and explore how well they define distinct cell populations.
+Suggested steps:
+- Identify marker genes per cluster (e.g. using top_markers() or Seurat equivalents)
+- Select the top ~5 genes per cluster based on statistical significance
+- Visualize their expression across clusters (e.g. UMAP, heatmaps, or feature plots)
+Questions to consider:
+- Do the identified markers clearly separate clusters?
+- Are some markers shared across clusters?
+- Can you relate marker genes to known cell types or biological functions (e.g. from literature)?
+
+**Topic 2 (Groups 3 & 4): Effects of parameter choices on trajectory inference**
+Investigate how different parameter settings affect the inferred trajectory and pseudotime.
+Suggested steps:
+- Run learn_graph() with different parameters: close_loop, learn_graph_control (e.g. pruning on/off)
+- Compare resulting trajectory structures visually
+- Compute pseudotime using different root node choices
+Questions to consider:
+- How stable is the trajectory structure under parameter changes?
+- What changes when graph pruning is turned off?
+- How does the choice of root node affect pseudotime interpretation? Based on biological knowledge, what would be a reasonable root cell population?
+
+**Topic 3 (Groups 5 & 6): Gene expression dynamics along pseudotime**
+Identify genes whose expression changes along differentiation trajectories.
+Suggested steps:
+- Select a subset of cells (e.g. one lineage or branch)
+- Use graph_test() to identify genes associated with pseudotime
+- Select the top ~5 genes based on statistical significance
+- Visualize their expression along pseudotime (e.g. plot_genes_in_pseudotime())
+Questions to consider:
+- Do genes show clear trends (e.g. increasing, decreasing, transient expression)?
+- Are there differences between branches or cell types?
+- Are any of these genes known to play a role in hematopoiesis?
+
+
+## Convert Seurat object to Monocle
+
+To start our trajectory inference analysis, we first have to convert our Seurat object to a Monocle3 object. We will use the package ```SeuratWrappers``` to directly convert it. (If it was not possible to install SeuratWrappers, see alternative below)
+
+### Using SeuratWrappers
+
+```{r}
+# Convert Seurat object to Monocle3 cell_data_set
+cds <- as.cell_data_set(seurat)
+
+#Add gene names to row data
+rowData(cds)$gene_short_name <- rownames(seurat)
+```
+
+### Alternative: Manually
+
+```{r eval=FALSE}
+
+library(Matrix)
+
+# Extract components from Seurat object
+expression_matrix <- GetAssayData(seurat, assay = "RNA", layer = "counts")
+expression_matrix <- as(expression_matrix, "sparseMatrix")
+
+cell_metadata <- metadata
+gene_metadata <- data.frame(gene_short_name = rownames(expression_matrix), row.names = rownames(expression_matrix))
+
+# Create Monocle3 cell_data_set object
+cds2<- new_cell_data_set(expression_matrix,
+                         cell_metadata = cell_metadata,
+                         gene_metadata = gene_metadata)
+
+#Remove no longer necessary objects 
+rm(expression_matrix, cell_metadata, gene_metadata)
+```
+
+
+# sessionInfo
+```{r}
+sessionInfo()
+```
