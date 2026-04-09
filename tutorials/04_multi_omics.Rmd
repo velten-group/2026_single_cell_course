@@ -1,0 +1,620 @@
+---
+title: "Using MOFA to integrate single-cell multi-omics data"
+date: "`r Sys.Date()`"
+author: "Team name"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+# Introduction
+
+This project aims at using MOFA for the integration of single-cell multi-omics data.
+
+In particular we will be working with the data from the following study: [Multi-omics profiling of mouse gastrulation at single-cell resolution](https://www.nature.com/articles/s41586-019-1825-8). This study sequenced mouse embryonic stem cells as they undergo the process of gastrulation, during which the three primary germ layers are formed. MOFA provides a method for delineating coordinated variation between the transcriptome and the epigenome.
+
+In this project you will work with a subset of the original data and re-analyse the data to reproduce the main findings.
+
+**Task 1: Take a look at the [original study](https://www.nature.com/articles/s41586-019-1825-8) to get a better understanding of the dataset.**
+
+# Load libraries
+
+To get started please load the following libraries that you will need for this analysis.\
+
+```{r eval = FALSE, include = FALSE}
+install.packages('data.table')
+BiocManager::install("MOFA2")
+```
+
+```{r, message=FALSE}
+library(data.table)  # fast manipulation of data.frames
+library(purrr)       # pipes to make the code more readable
+library(Seurat)
+library(ggplot2)
+library(MOFA2)
+```
+
+# Data
+
+Modify the data directory below to point to the folder containing the data for project 2
+
+```{r}
+data_dir <- "../../course_data/data"
+```
+
+# Notes
+
+This document contains two parts; processing of the individual data modalities, and integration using MOFA. You might want to use separate Rmd files for each part to avoid too long execution times of the full notebook. Remember that you will need to load the libraries and specify the data directory as done above in each individual file.
+
+# Part 1 - Processing and visualising the data
+
+The first step in every single-cell experiment is to get the data into a usable format and to do quality control. Since these steps can often be quite resource intensive, we already provide partly preprocessed data for you. If you are interested in the preprocessing you can have a look at the [full analysis folder of the paper](https://github.com/rargelaguet/scnmt_gastrulation). You can also find links to the full data there. Here we provide you with a metadata file that will give an overview of the quality control and links samples across the different layers.
+
+## A. Metadata
+
+```{r}
+metadata <- fread(file.path(data_dir, "sample_metadata_filtered_clean.txt"))
+```
+
+**Task 2: Take a look at the metadata - what is the meaning of each column? Do you recall from the original paper how the lineage was assigned to each cell?**
+
+```{r}
+head(metadata)
+```
+
+
+## B. RNA data
+
+We will first look into the RNA data. From last week you are already familiar with Seurat for scRNA-seq data analysis.
+
+We take following processing steps:
+
+1)  add the metadata above to the object
+2)  subset the object to only cells that passed the RNA QC
+3)  Normalize the data
+4)  Find the top 1000 most highly variable genes
+5)  Scale the data to mean 0 and unit variance
+
+```{r}
+rna <- readRDS(file.path(data_dir, "rna/seurat_object.rds"))
+rna 
+
+# Add the metadata table to the seurat object
+rna <- AddMetaData(rna, metadata = data.frame(metadata, row.names = metadata$sample))
+# Make sure only cells that pass the qc are used
+rna <- rna[, rna$pass_rnaQC == TRUE]
+# Log t
+rna <- NormalizeData(rna)
+# Find the top 1000 most highly variable genes
+rna <- FindVariableFeatures(rna, nfeatures = 1000)
+
+VariableFeaturePlot(rna)
+
+# Scale the data to mean 0 and unit variance
+rna <- ScaleData(rna)
+```
+
+**Task 3: Produce a PCA plot of the cells that have passed the RNA QC with the 1000 most variable genes selected above, and colour the cells by stage. What is captured by the first principal components? How many components would you look at?**
+
+
+**Task 4: Create a UMAP plot of the cells, do you see a separation of the different stages and lineages here? What can you conclude from these plots?**
+
+
+## C. Epigenetic data
+
+The DNA methylation and accessibility data looks different to the count matrices we see for RNA expression data. Again we will not perform the preprocessing here, but to give you an idea we will describe how the different steps work.
+
+**Some Additional Info**:
+
+The sequencing technique used is called [Bisulfite sequencing](https://en.wikipedia.org/wiki/Bisulfite_sequencing). Briefly, bisulfite sequencing exploits the fact that bisulfite converts cytosine residues in the DNA to uracil, but only if they are unmethylated. This converts the epigenetic mark into a sequencable readout. Additionally, a technique called [NoMe](https://elifesciences.org/articles/23203) seq is used to gain accessibility information. Here an external Methyltransferase is introduced into cells, methylating accessible GpC sites. This signal can then also be picked up by bisulfite sequencing.
+
+Since the alignment to the genome is complicated by the fact that some cytosines have to be converted, a special aligner (in this case Bismarck) has to be used. The tool then calls methylation at CpG and GpC sites in all cells.
+
+The file `E4.5-5.5_new_Plate1_A03` provides raw methylation data - to give an idea what the values look like we here plot a histogram:
+
+```{r}
+met_raw <- fread(file.path(data_dir, "/met/cpg_level/E4.5-5.5_new_Plate1_A03.tsv.gz"))
+hist(met_raw$rate)
+```
+
+As each cell typically has one methylation state at each CpG site, the data is in a binary zero/one format for each cell and CpG site. In order to combat the sparsity of this data (on average less than 1% of CpG sites are covered in any given cell), methylation and accessibility information is typically aggregated over known regulatory regions. You can find some aggregated files in `gastrulation_data/met/feature_level/`. Here we take a look at aggregated rates for gene promoters, for which we provide a dataset that extends 2000 bp to each side of the transcription start sites of genes:\
+
+```{r}
+# Read promoter methylation
+met_prom <- fread(file.path(data_dir, "/met/feature_level/prom_2000_2000_clean.tsv.gz"))
+head(met_prom)
+```
+
+In this table `sample` corresponds to the cell_id, `id` is the identifier for the genomic region, `N` is the number of CpG sites that the signal is based on and `rate` is the mean methylation rate.
+
+Similar to the log-transformation of RNA data we will also make use of normalization to transform the rates to a quantity that is better modeled by a normal distribution, on which many standard analysis techniques rely. In an ideal scenario we would use tools that can directly model the binomial nature of the data, but normalizing is common practice in many workflows.
+
+Here we will be working with M-values, which are calculated as `log2(((rate/100)+0.01)/(1-(rate/100)+0.01))`:
+
+```{r}
+hist(met_prom$rate)
+met_prom[,m:=log2(((rate/100)+0.01)/(1-(rate/100)+0.01))]
+```
+
+**Task 5: How are these aggregated rates distributed? Comparing the raw aggregated methylation rates to the M-values, does it look like they are modeled better by a normal distribution?\
+**
+
+
+### i. Relating methylation to gene expression
+
+Promoter methylation is known to silence the expression of it's gene. Let's check if that is also the case in this dataset.
+
+Here we calculate the correlation between gene expression and promoter methylation for each gene using the code below. The code computes correlation coefficients (r) and respective p values between each gene's gene expression and methylation.
+
+```{r, warning=F, message=F}
+# Filter the promoter methylation to cells passing methylation QC (using the metadata)
+cells <- metadata[pass_metQC == TRUE, sample]
+met_prom <- met_prom[sample %in% cells]
+
+# Filter the promotor methylation data to genomic regions covered in at least 50 cells
+met_prom <- met_prom %>% .[,N:=.N, by="id"] %>% .[N>=50] %>% .[,N:=NULL]
+
+# Get rna data in long format
+rna_dt <- GetAssayData(rna) %>%
+  as.data.table(keep.rownames = "id") %>%
+  melt(id.vars = "id", variable.name = "sample", value.name = "expr")
+
+# Merge met and rna information
+metrna_dt <- merge(met_prom, rna_dt, by = c("id", "sample"))
+
+# Compute correlations and test for significance
+cor_met <- metrna_dt[, .(V1 = unlist(cor.test(m, expr)[c("estimate", "statistic", "p.value")])), by = "id"] %>%
+  .[, para := rep(c("r","t","p"), .N/3)] %>% data.table::dcast(id ~ para, value.var = "V1") %>%
+  .[, c("padj_fdr", "padj_bonf") := list(p.adjust(p, method="fdr"), p.adjust(p, method="bonferroni"))] %>%
+  .[, c("log_padj_fdr","log_padj_bonf") := list(-log10(padj_fdr), -log10(padj_bonf))] %>%
+  .[, sig := padj_fdr <= 0.1] %>%  setorder(padj_fdr) %>% .[!is.na(p)]
+
+p1 <- hist(cor_met$p, breaks = 50)
+p2 <- plot(cor_met$r, cor_met$log_padj_fdr)
+```
+
+**Task 6: Review this correlation analysis and the plots. How are the p-values distributed? Do you see evidence for a negative correlation of methylation and gene expression?**
+
+
+### ii. Relating accessibility to gene expression
+
+We also have accessibility information for promoters. We will perform the same analysis, with one main modification:
+
+-   We are using windows of only 200 bp around the TSS. This gives better results since our coverage is higher for accessibility.
+-   We require 3 GpC sites to be detected in each cell and window. Again, we can do this since we have higher coverage.
+
+**Task 7: Use the file `prom_200_200_clean.tsv.gz` and perform the same correlation analysis as above for methylation between m-values and expression. Do you see evidence for a positive correlation of accessibility and gene expression?**
+
+Hint: You will need the following steps
+
+1)  Read in the data and calculate m-values based on the rates
+2)  Use only cells that passed the QC for accessibility
+3)  Filter to windows that have at least 3 GpC sites and are covered in at least 50 cells
+
+
+### iii. Relating information from all three layers
+
+As an example, to get an overview of the correlations between the three layers, we here provide the code to roughly reproduce Panel g and h of Figure 1 of the original study using the results from task 6 and 7.
+
+```{r}
+# A. Correlation of accesibility to RNA expression over methylation to RNA expression
+plot_dt <- merge(cor_met, cor_acc, by = "id", suffixes = c("_met", "_acc"))
+ggplot(plot_dt, aes(x = r_met, y = r_acc, color = sig_met & sig_acc)) +
+  geom_point(size = 1, aes(alpha = sig_met & sig_acc)) + 
+  geom_hline(yintercept = 0, color = "orange") +
+  geom_vline(xintercept = 0, color = "orange") +
+  scale_color_manual(values = c("black", "red")) +
+  xlab("Methylation/RNA correlation") +
+  ylab("Accessibility/RNA correlation") +
+  theme_classic() 
+
+# B. Promoter epigenetics of Dppa4 (ENSMUSG00000058550) in relation to its expression (across stages)
+gene_name <- "ENSMUSG00000058550"
+
+# Merge together all 3 layers and metadata
+all_layers <- rna_dt[id == gene_name] %>%
+  #.[, rna_expression := logcounts(sce)[gene_name,][id_rna]] %>%
+  merge(acc_prom[id == gene_name, c("sample", "rate")], by = c("sample"), all.x = T) %>%
+  merge(met_prom[id == gene_name, c("sample", "rate")], by = c("sample"), all.x = T, suffixes = c("_acc","_met")) %>%
+  merge(metadata, by = "sample")
+  
+plot_dt <- melt(all_layers, id.vars = c("sample", "stage"),
+                measure.vars = c("expr", "rate_acc", "rate_met"),
+                variable.name = "Layer")
+plot_dt %>%
+  ggplot(aes(x = stage, y = value, color = Layer, fill = Layer)) +
+  geom_jitter() +
+  geom_violin(alpha = 0.3, color = "black") +
+  geom_boxplot(alpha = 0.3, width = 0.1, color = "black") +
+  facet_grid(Layer~., scales = "free_y") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+**Optional: Feel free to explore more genes than Dppa4 on your own in the 2nd plot, e.g. focusing on those that show strong correlations between the epigenetic and RNA data.**
+
+### iv. Dimensionality reduction of methylome
+
+Similar to PCA for RNA data we can also visualize the cells using PCA based on their epigenetic information. As in the paper we will use DNAse hypersensitivity sites for this.
+
+```{r}
+met_dnase <- fread(file.path(data_dir, "/met/feature_level/ESC_DHS_clean.tsv.gz"))
+# Keep only cells that pass the QC
+cells <- metadata[pass_metQC == TRUE, sample]
+met_dnase <- met_dnase[sample %in% cells]
+hist(met_dnase$N)
+```
+
+Since the Signal is so sparse and many sites are not covered in a cell, we need a robust way of doing dimensionality reduction that can handle missing values (in contrast to principal component analysis). Linear Bayesian Factor analysis (which is the basis for MOFA) will work well in these scenarios. Note that this is not yet doing any integration of different omic layers but just using factor analysis for an individual omic layer similar to principal component analysis.
+
+However some preprocessing of the data has to be done first.
+
+-   We transform the `rate` value into `m` values to make them approximately normally distributed.
+
+-   We filter out DNAse hypersensitivity sites that are covered by less than 10% of cells.
+
+-   We select only the 5000 most highly variable sites.
+
+```{r}
+# Calculate M value from Beta value 
+met_dnase[,m:=log2(((rate/100)+0.01)/(1-(rate/100)+0.01))]
+
+min_coverage = 0.10
+n_hv = 5000
+
+# Filter features by coverage
+nsamples <- length(unique(met_dnase$sample))
+met_dnase <- met_dnase %>% .[,cov:=.N/nsamples,by=id] %>%
+  .[cov>=min_coverage] %>% .[,c("cov"):=NULL]
+
+# Keep only highly variable sites
+keep_hv_sites <- met_dnase %>%
+  .[,.(var = var(rate)), by="id"] %>% 
+  .[var>0] %>% setorder(-var) %>%
+  head(n = n_hv) %>% .$id
+
+met_dnase <- met_dnase[id %in% keep_hv_sites]
+```
+
+Now we can transform the data into matrix format to run dimensionality reduction.
+
+```{r}
+met_mat <- dcast(met_dnase, formula = sample~id, value.var = "m") %>%
+  tibble::column_to_rownames("sample") %>%
+  as.matrix %>% t
+
+met_mat[1:5, 1:5]
+
+```
+
+**Task 8: What proportion of values is missing in the resulting matrix?**
+
+
+We will use `MOFA` for this factor analysis. Note that this is not yet doing any multiomics integration but similar to principal component analysis extracting the first PCs in the presence of missing values.
+
+```{r}
+# create a MOFA object
+MOFAobject <- create_mofa(list(met_mat))
+
+# Set options
+ModelOptions <- get_default_model_options(MOFAobject)
+ModelOptions$num_factors <- 2
+ 
+TrainOptions <- get_default_training_options(MOFAobject)
+TrainOptions$seed <- 42
+
+# Prepare
+MOFAobject <- prepare_mofa(MOFAobject,
+  model_options = ModelOptions, 
+  training_options = TrainOptions
+)
+
+# Train the model
+model <- run_mofa(MOFAobject, use_basilisk = TRUE)
+```
+
+Let's visualize the Factors using the `plot_factors` function from the MOFA package.
+
+```{r}
+metadata_plot <- metadata %>% setkey(sample) %>%
+  .[samples_names(model)]
+p <- plot_factors(
+  model, 
+  factors = c(1,2),
+  color_by = metadata_plot$stage
+  )
+p 
+```
+
+**Task 9: Does the methylation rate within DNAse hypersensitive sites distinguish cells of different stages? What does this mean? Compare also to Figure 1c of the original study.**
+
+### v. Dimensionality reduction of accessibility data
+
+**Task 10: Follow the same steps as above to generate a dimensionality reduction based on the accessibility of DNAse hypersensitive sites from the file `acc/feature_level/ESC_DHS_clean.tsv.gz`. Can you produce a figure similar to Figure 1d in the original study?**
+
+Make use of the following pre-processing parameters:
+
+-   `min_coverage = 0.10`
+-   `n_hv = 10000`
+
+In addition, we now require 5 GpC sites to be detected in each cell and window. Again, we can do this since we have higher coverage.
+
+
+# Part 2 - Integrating the data from different omic layers using MOFA
+
+In the second part we will now combine the information from all three omic layers. Here we skip all the data processing details as well as the model training part that you have seen in the first part of the project. We focus on the downstream characterisation of a pretrained MOFA model. If you are interested in the code to train the model from the data linked above, have a look at the script `train_MOFA_model.R` in the data folder.
+
+## A. Load pre-computed MOFA model
+
+As input to the model DNA methylation and chromatin accessibility values are quantified over two different sets of regulatory elements: gene promoters and enhancer elements. RNA expression was quantified over protein-coding genes. After data processing, separate views were defined for the RNA expression and for each combination of genomic context and epigenetic readout.
+
+Note that for this tutorial we selected the MOFA Factors that explained at least 1% of variation in the RNA expression.
+
+```{r}
+MOFAobject <- readRDS(file.path(data_dir, "/MOFAmodel.rds"))
+MOFAobject
+```
+
+**Task 11: Explore the print-out of the MOFAobject. How many cells were used for training the model?**
+
+We use the `samples_metadata` function on the MOFAobject to explore the meta data of the cells. The columns refer to
+
+\- **sample**: cell ID\
+- **stage**: developmental stage.\
+- **lineage**: cell type annotation (derived from mapping the cells to the [10x reference atlas](https://www.nature.com/articles/s41586-019-0933-9)).\
+- **pass_rnaQC**: did the cell pass QC for RNA expression?.\
+- **pass_metQC**: did the cell pass QC for DNA methylation? `NA` if the cell was only profiled for RNA.\
+- **pass_accQC**: did the cell pass QC for chromatin accessibility? `NA` if the cell was only profiled for RNA.\
+- **group**: ignore this column
+
+```{r}
+head(samples_metadata(MOFAobject))
+```
+
+**Task 12: How many cells from each lineages are in the object?**
+
+
+Notice that there are a lot of cells that only have RNA expression measurements. One of the major advantages of MOFA is that it handles missing values, so we don't have to remove these cells prior to model training
+
+**Task 13: How many cells do not have DNA methylation measurements?**
+
+Remember that those cells have `NA` in the `pass_metQC` column.
+
+
+## B. Overview of training data
+
+The function `plot_data_overview` can be used to obtain an overview of the input data. It shows how many views (rows) and how many cells (columns) exist, and what their corresponding dimensionalities are. It also shows which views each cell is missing.
+
+```{r fig.align="center"}
+view.colors <- c(
+  "RNA" = "#3CB54E",
+  "Enhancers accessibility" = "#00BFC4",
+  "Promoters accessibility" = "#00BFC4",
+  "Enhancers methylation" = "#F37A71",
+  "Promoters methylation" = "#F37A71"
+)
+view.colors = view.colors[views_names(MOFAobject)]
+
+plot_data_overview(MOFAobject, colors = view.colors)
+```
+
+The data in the MOFA model has been normalised before training. For RNA data this is similar to what you have seen in the `Seurat` workflow (here a slightly different approach was used called `scran`), for the epigenetic data m-values were used as introduced above. MOFA uses a normal likelihood to model these resulting values in all modalitites
+
+**Task 14: Plot a histogram of the values for the RNA, methylation and accessibility views. How good is the normal distribution as an approximation for the data? Optional: What could be other ways of modelling this distribution?**
+
+*Hint*: You can extract the values using the `get_data` function. For details on the function call `?get_data`. As the results will be a nested list you have to extract the matrix from it for plotting, e.g. `get_data(MOFAobject, views="RNA")[[1]][[1]]`
+
+
+## C. Variance decomposition analysis
+
+The most important insight that MOFA generates is the variance decomposition analysis using `plot_variance_explained`. This plot shows the percentage of variance explained by each factor in each data modality. From this we can identify shared sources of variation across multiple omic modalities.
+
+```{r}
+plot_variance_explained(MOFAobject) +
+  theme(
+    axis.text.x = element_text(angle=25, hjust=1, vjust=1.05)
+  )
+```
+
+**Task 15: What insights from the data can we learn about each of the factors just from inspecting this plot?**
+
+
+## D. Characterisation of Factor 1
+
+There are a few systematic strategies to characterise the molecular signal that underlies each MOFA factor:
+
+-   **Association analysis between the sample metadata and the Factor values**: function `correlate_factors_with_covariates`
+-   **Inspection of factor values**: functions `plot_factor` (one factor at a time) and `plot_factors` (combinations of factors)
+-   **Inspection of the feature weights**: functions `plot_weights` (all weights), `plot_top_weights` (only the top weights)
+-   **Gene set enrichment analysis on the mRNA weights**: functions `run_enrichment`, followed by `plot_enrichment`.
+
+### i. Factor values
+
+Plotting Factor 1 values and colouring cells by lineage assignment shows that this factor captures the variation that is associated with the separation between Mesoderm (positive Factor values) and non-Mesoderm cells (negative Factor values).
+
+```{r}
+plot_factor(MOFAobject,
+  factor = 1,
+  color_by = "lineage", 
+  add_violin = TRUE,
+  dodge = TRUE
+) 
+```
+
+*How do we interpret the factor values?* Each factor captures a different source of variability in the data. Mathematically, each Factor is defined by a linear combination of the input features. Each Factor ordinates cells along a one-dimensional axis that is centered at zero. Samples with different signs manifest opposite phenotypes along the inferred axis of variation, with higher absolute value indicating a stronger effect.\
+Note that the interpretation of MOFA factors is analogous to the interpretation of the principal components in PCA.
+
+### ii. RNA weights
+
+The weights provide a score for each gene on each factor. Genes with no association with the factor are expected to have values close to zero, whereas genes with strong association with the factor are expected to have large absolute values. The sign of the weight indicates the direction of the effect: a positive weight indicates that the feature is more active in the cells with positive factor values, and vice versa.
+
+Let's plot the distribution of weights for Factor 1.
+
+```{r, warnings=FALSE, message=FALSE}
+plot_weights(MOFAobject,
+  view = "RNA",
+  factor = 1,
+  nfeatures = 10,     # Top number of features to highlight
+  scale = T           # Scale weights from -1 to 1
+)
+```
+
+If you are not interested in the full distribution, but just on the top weights, you can instead do:
+
+```{r}
+plot_top_weights(MOFAobject, 
+  view = "RNA", 
+  factor = 1, 
+  nfeatures = 10,
+  scale = T, 
+  abs = T
+)
+```
+
+We expect genes with large positive weights For Factor 1 to be highly expressed in the Mesoderm cells. If we plot Factor 1 colouring cells by gene expression of the top genes **with positive weight**:
+
+```{r}
+genes <- c("Phlda2","Mesp1")
+
+for (i in genes) {
+  plot_factor(MOFAobject,
+    factor = 1,
+    dot_size = 2.5,
+    group_by = "lineage",
+    color_by = i
+  ) %>% print
+}
+```
+
+Similarly, we expect that genes with large negative weights For Factor 1 to be lowly expressed in the Mesoderm cells. If we plot Factor 1 colouring cells by gene expression of the top genes **with negative weight**:
+
+```{r}
+genes <- c("Cldn6","Pim2")
+
+for (i in genes) {
+  plot_factor(MOFAobject,
+    factor = 1,
+    dot_size = 2.5,
+    group_by = "lineage",
+    color_by = i
+  ) %>% print
+}
+```
+
+### iii. RNA expression patterns in the high-dimensional space
+
+The weights are useful to identify which genes are driving each factors. After inspecting the weights it is good practice to go back to the high-dimensional space and check if the variability that MOFA captures is real.\
+For example, one could generate a heatmap plot of the RNA expression for the top genes, where samples are sorted by the corresponding factor values. This is the aim of the `plot_data_heatmap` function:
+
+```{r}
+plot_data_heatmap(MOFAobject, 
+  view = "RNA", 
+  factor = 1, 
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`,
+  show_colnames = F, cluster_cols = F
+)
+```
+
+### iv. DNA methylation weights
+
+As we have done with RNA, we can also visualise the distribution of weights for the epigenetic modalities. The problem about this is that the large majority of enhancers are not well annotated and we only have the genomic coordinates for them...
+
+```{r}
+plot_weights(MOFAobject,
+  view = c("Enhancers methylation"),
+  factor = 1,
+  nfeatures = 5,
+  scale = F
+)
+```
+
+### v. DNA methylation patterns in the high-dimensional space
+
+As done with the RNA above, let's visualise in the high-dimensional space the DNA methylation variation that MOFA captures using the `plot_data_heatmap` function. Notice how noisy and sparse DNA methylation data is.
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Enhancers methylation", 
+  factor = 1, 
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+To alleviate this we will use MOFA to impute the missing values. This is achieved by reconstructing the data using the matrix factorisation equation from MOFA:
+
+$$\hat{\mathbf{Y}}^m = \mathbf{W}^m\mathbf{Z}$$ where $\mathbf{W}^m$ is the weight matrix for the $m$-th view, and $\mathbf{Z}$ is the (shared) factor matrix.
+
+```{r}
+MOFAobject <- impute(MOFAobject)
+```
+
+Plot heatmap with `impute=TRUE` argument.
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Enhancers methylation", 
+  factor = 1, 
+  impute = TRUE,
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+**Task 16: For comparison also plot the data heatmap of promoter methylation. As we have seen low values in the variance decomposition, we would not expect a strong separation given by factor 1.**
+
+
+## E. Characterisation of Factor 2
+
+**Task 17: Can you use the functions and analyses strategies introduced above to characterize Factor 2 in the model?**
+
+-   What germ layer does it capture?
+-   Which genes' expression is linked to it?
+-   How do methylation values change along this factor?
+
+
+## F. 2-dimensional representation
+
+The first two factors capture in two dimensions all the variation that is required to separate the three germ layers. It corresponds to [Figure 2b in the original paper](https://www.nature.com/articles/s41586-019-1825-8).
+
+```{r}
+plot_factors(MOFAobject,
+  factors = c(1,2), 
+  color_by = "lineage",
+  dot_size = 2,
+  legend = TRUE
+) 
+```
+
+**Task 19: Change the `color_by` argument to a gene name to colour the scatterplot above by the expression of genes that you have identified in the previous analyses as markers for the the different germ layers with highest or lowest weight on the factor. Is their expression in line with the variation captured in the 2-dimensional plot?**
+
+
+# Part 3 (optional): Using pseudo-time annotations of cells with MEFISTO
+
+In the lectures you have also learnt about the concept of pseudo-time which can be used in extensions of MOFA to account for temporal or spatial information on the samples. In [MEFISTO](https://www.nature.com/articles/s41592-021-01343-9) we can make use of pseudotime information for each cell to distinguish patterns of variation (i.e., factors) that vary smoothly along pseudotime from other non-smooth sources of variation, e.g. cell cycle. If you are interested take a look at the [MEFISTO paper](https://www.nature.com/articles/s41592-021-01343-9) and the Figure 4 therein.
+
+To reproduce this we can train a similar model on the full data from all 4 stages and additionally pass the pseudo-time values for each cell to MOFA. If you are interested in how this works and what other types of down-stream analysis are possible have a look at [this tutorial](https://raw.githack.com/bioFAM/MEFISTO_tutorials/master/scnmt_mefisto_vignette.html). The required data can be downloaded from [here](https://figshare.com/articles/dataset/MEFISTO_Data_for_tutorials/13233860).
+
+# sessionInfo
+
+```{r}
+sessionInfo()
+```
+
+# Contributors
+
+Project material is based on material by Britta Velten, Ricard Argelaguet and Max Frank.
